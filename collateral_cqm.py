@@ -33,6 +33,7 @@ Backends:
   - "hybrid" : CQM with Real vars -> LeapHybridCQMSampler (Leap cloud)
 """
 
+import warnings
 import numpy as np
 import dimod
 import neal
@@ -257,7 +258,10 @@ def solve_cqm(assets=None, obligations=None,
         bqm_kwargs = {}
         if lagrange_multiplier is not None:
             bqm_kwargs["lagrange_multiplier"] = lagrange_multiplier
-        bqm, inverter = dimod.cqm_to_bqm(cqm, **bqm_kwargs)
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="Did not add constraint")
+            warnings.filterwarnings("ignore", message="For constraints with fractional")
+            bqm, inverter = dimod.cqm_to_bqm(cqm, **bqm_kwargs)
 
         bqm_sampleset = sampler.sample(
             bqm,
