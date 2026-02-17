@@ -1,6 +1,6 @@
 # Collateral Optimisation
 
-Solves the bank collateral allocation problem using three approaches: Linear Programming (LP), Mixed-Integer Programming (MIP), and Quadratic Unconstrained Binary Optimisation (QUBO) with simulated annealing. Includes a crossover benchmark comparing MIP vs QUBO at scale.
+Solves the bank collateral allocation problem using three approaches: Linear Programming (LP), Mixed-Integer Programming (MIP), and Quadratic Unconstrained Binary Optimisation (QUBO) with D-Wave Ocean SDK. Supports local simulated annealing, D-Wave QPU (quantum annealer), and D-Wave hybrid classical-quantum solvers. Includes a crossover benchmark comparing MIP vs QUBO at scale.
 
 ## Problem
 
@@ -11,12 +11,23 @@ A bank holds a portfolio of assets (bonds, cash, equities) that must be posted a
 - Python 3.8+
 - NumPy
 - SciPy
+- D-Wave Ocean SDK (`dwave-neal`, `dimod`)
+- D-Wave System (optional, for QPU/hybrid backends): `dwave-system`
 
 ```
-pip install numpy scipy
+pip install numpy scipy dwave-neal dimod
 ```
 
-No other dependencies are required. The QUBO solver uses a pure-Python simulated annealing implementation.
+For D-Wave QPU or hybrid cloud solvers, also install:
+
+```
+pip install dwave-system
+dwave config create
+```
+
+The `dwave config create` command will prompt you for your D-Wave Leap API token. You can get a free account at [cloud.dwavesys.com](https://cloud.dwavesys.com).
+
+The QUBO solver uses D-Wave's `neal.SimulatedAnnealingSampler` (local, no account needed), `DWaveSampler` (QPU quantum annealer), or `LeapHybridSampler` (classical-quantum hybrid). The model is built using `dimod.BinaryQuadraticModel`, which is the standard format across all D-Wave solvers.
 
 ## Project Structure
 
@@ -25,7 +36,7 @@ No other dependencies are required. The QUBO solver uses a pure-Python simulated
 | `problem_data.py` | Shared asset inventory and obligation definitions |
 | `collateral_optimisation.py` | LP solver using `scipy.optimize.linprog` (HiGHS) |
 | `collateral_mip.py` | MIP solver using `scipy.optimize.milp` (HiGHS branch-and-bound) |
-| `collateral_qubo.py` | QUBO solver with simulated annealing |
+| `collateral_qubo.py` | QUBO solver using D-Wave Ocean SDK (`dimod` + `neal` / QPU / hybrid) |
 | `main.py` | Crossover benchmark: MIP vs QUBO at increasing problem sizes |
 | `bcbs189.pdf` | Basel III regulatory framework (BCBS 189) reference document |
 
@@ -54,23 +65,71 @@ Adds realistic integer constraints on top of the LP. Parameters are configured i
 | `max_assets_per_obligation` | `None` | Maximum number of distinct assets that can be posted to a single obligation. `None` disables this constraint. |
 | `time_limit` | `60.0` | Solver time limit in seconds. HiGHS branch-and-bound will return the best solution found within this budget. |
 
-### QUBO Solver (simulated annealing)
+### QUBO Solver (D-Wave Ocean SDK)
+
+Reformulates the problem into a `dimod.BinaryQuadraticModel` (QUBO) and solves using one of three D-Wave backends. Supports command-line arguments:
 
 ```
+python collateral_qubo.py [--backend {neal,qpu,hybrid}] [options]
+```
+
+**Backends:**
+
+| Backend | Command | Description | Requirements |
+|---|---|---|---|
+| `neal` (default) | `python collateral_qubo.py` | Local simulated annealing (C++ via D-Wave Neal) | `dwave-neal`, `dimod` |
+| `qpu` | `python collateral_qubo.py --backend qpu` | D-Wave Advantage quantum annealer | `dwave-system` + Leap API token |
+| `hybrid` | `python collateral_qubo.py --backend hybrid` | D-Wave hybrid classical-quantum solver | `dwave-system` + Leap API token |
+
+**Common parameters:**
+
+| CLI flag | Parameter | Default | Description |
+|---|---|---|---|
+| `--num-chunks` | `num_chunks` | `10` | Binary bits per (asset, obligation) pair. Each chunk represents `market_value / num_chunks` dollars. Higher = better precision but larger search space. |
+| `--penalty-weight` | `penalty_weight` | `1.0` | Multiplier for constraint-violation penalties. Higher values force feasibility at the expense of objective quality. |
+| `--num-reads` | `num_reads` | `20` | Number of independent SA/QPU runs. Best solution across all runs is returned. (neal and qpu only) |
+
+**Neal-only parameters (simulated annealing):**
+
+| CLI flag | Parameter | Default | Description |
+|---|---|---|---|
+| `--num-sweeps` | `num_sweeps` | `5000` | Sweeps per SA run. Each sweep visits every variable once. More sweeps allow better convergence. |
+| — | `seed` | `42` | Random seed for reproducibility (Python API only). |
+| — | `beta_range` | `None` | Inverse temperature range `(beta_min, beta_max)`. `None` lets Neal auto-calculate from QUBO coefficients. (Python API only) |
+| — | `beta_schedule_type` | `"geometric"` | Temperature schedule: `"geometric"` or `"linear"`. Geometric cools faster at high temperatures. (Python API only) |
+
+**QPU-only parameters (D-Wave Advantage quantum annealer):**
+
+| CLI flag | Parameter | Default | Description |
+|---|---|---|---|
+| `--annealing-time` | `annealing_time` | `None` (20μs) | Annealing time in microseconds. Range: 1–2000μs. Longer times can improve solution quality. |
+| `--chain-strength` | `chain_strength` | `None` (auto) | Coupling strength for embedding chains. `None` lets `EmbeddingComposite` auto-calculate. |
+
+**Hybrid-only parameters (LeapHybridSampler):**
+
+| CLI flag | Parameter | Default | Description |
+|---|---|---|---|
+| `--time-limit` | `time_limit` | `None` (auto) | Time limit in seconds (minimum 3). `None` lets the hybrid solver choose automatically. |
+
+**Examples:**
+
+```bash
+# Local simulated annealing (default, no cloud account needed)
 python collateral_qubo.py
+
+# More precision with 20 chunks and higher penalty
+python collateral_qubo.py --num-chunks 20 --penalty-weight 2.0 --num-sweeps 10000
+
+# D-Wave QPU with 100 reads and 200μs annealing time
+python collateral_qubo.py --backend qpu --num-reads 100 --annealing-time 200
+
+# D-Wave hybrid solver with 10 second time limit
+python collateral_qubo.py --backend hybrid --time-limit 10
 ```
-
-Reformulates the problem into a QUBO matrix and solves via simulated annealing. Parameters are configured in `solve_qubo()`:
-
-| Parameter | Default | Description |
-|---|---|---|
-| `num_chunks` | `10` | Number of binary bits per (asset, obligation) pair. Each chunk represents `market_value / num_chunks` dollars. Higher values give better precision but exponentially larger search space. |
-| `penalty_weight` | `1.0` | Multiplier for constraint-violation penalties. Higher values force feasibility at the expense of objective quality. |
-| `num_reads` | `20` | Number of independent SA runs. The best solution across all runs is returned. |
-| `num_sweeps` | `5000` | Number of temperature sweeps per SA run. Each sweep visits every variable once. More sweeps allow better convergence. |
-| `seed` | `42` | Random seed for reproducibility. |
 
 **QUBO variable count**: For `A` assets, `O` obligations, and `K` chunks, the number of binary variables is up to `A * O * K` (reduced by eligibility filtering). For the default problem (7 assets, 4 obligations, 10 chunks), this is ~210 variables.
+
+**D-Wave QPU notes**: The D-Wave Advantage QPU has ~5000 qubits. After minor embedding overhead, problems up to ~150 logical variables typically embed well. For larger problems, use the hybrid backend which handles arbitrary sizes. QPU access requires a D-Wave Leap account — configure with `dwave config create`.
 
 ### Crossover Benchmark (MIP vs QUBO)
 
@@ -126,7 +185,9 @@ Each obligation requires:
 |---|---|---|---|---|---|
 | LP | Continuous | `A * O` | Linear | Yes (global) | Fastest |
 | MIP | Integer + binary | `2 * A * O` | Linear + big-M | Yes (global, if within time limit) | Exponential worst-case |
-| QUBO | Binary | `A * O * K` | Penalty-based (soft) | No (heuristic) | Polynomial in problem size |
+| QUBO (Neal SA) | Binary | `A * O * K` | Penalty-based (soft) | No (heuristic) | Polynomial in problem size |
+| QUBO (D-Wave QPU) | Binary | `A * O * K` | Penalty-based (soft) | No (heuristic) | ~μs per anneal, constant time |
+| QUBO (Hybrid) | Binary | `A * O * K` | Penalty-based (soft) | No (heuristic) | Handles large problems |
 
 ## Regulatory Context
 

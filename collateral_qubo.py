@@ -1,6 +1,6 @@
 """
-Collateral Optimisation using QUBO + Simulated Annealing
-=========================================================
+Collateral Optimisation using QUBO + D-Wave Ocean SDK
+======================================================
 
 QUBO (Quadratic Unconstrained Binary Optimisation) reformulates the collateral
 allocation problem into a form solvable by quantum annealers (D-Wave), gate-
@@ -28,13 +28,64 @@ QUBO formulation:
     3. Penalty for exceeding asset inventory          (quadratic terms)
     4. Eligibility is enforced structurally (ineligible variables excluded)
 
-We solve the QUBO with simulated annealing (Neal-style), using a vectorised
-numpy implementation for performance.
+Samplers:
+  - "neal"    : D-Wave Neal simulated annealing (C++, local, no account needed)
+  - "qpu"     : D-Wave Advantage quantum annealer (requires Leap account + API token)
+  - "hybrid"  : D-Wave hybrid solver (classical-quantum, handles large problems)
 """
 
 import numpy as np
+import dimod
+import neal
 
 from problem_data import ASSETS, OBLIGATIONS
+
+
+# ---------------------------------------------------------------------------
+# SAMPLER FACTORY
+# ---------------------------------------------------------------------------
+
+def _make_sampler(backend="neal"):
+    """
+    Create a D-Wave sampler based on the requested backend.
+
+    Parameters
+    ----------
+    backend : str
+        "neal"   — local simulated annealing (dwave-neal, no cloud needed)
+        "qpu"    — D-Wave Advantage quantum processing unit via Leap cloud
+        "hybrid" — D-Wave hybrid classical-quantum solver (LeapHybridSampler)
+
+    Returns
+    -------
+    sampler : dimod-compatible sampler
+    """
+    if backend == "neal":
+        return neal.SimulatedAnnealingSampler()
+
+    if backend == "qpu":
+        try:
+            from dwave.system import DWaveSampler, EmbeddingComposite
+        except ImportError:
+            raise ImportError(
+                "D-Wave QPU backend requires 'dwave-system'. "
+                "Install with: pip install dwave-system\n"
+                "Then configure your API token: dwave config create"
+            )
+        return EmbeddingComposite(DWaveSampler())
+
+    if backend == "hybrid":
+        try:
+            from dwave.system import LeapHybridSampler
+        except ImportError:
+            raise ImportError(
+                "D-Wave hybrid backend requires 'dwave-system'. "
+                "Install with: pip install dwave-system\n"
+                "Then configure your API token: dwave config create"
+            )
+        return LeapHybridSampler()
+
+    raise ValueError(f"Unknown backend '{backend}'. Use 'neal', 'qpu', or 'hybrid'.")
 
 
 # ---------------------------------------------------------------------------
@@ -43,7 +94,8 @@ from problem_data import ASSETS, OBLIGATIONS
 
 def build_qubo(assets, obligations, num_chunks=10, penalty_weight=1.0):
     """
-    Build the QUBO matrix for the discretised collateral problem.
+    Build the QUBO as a dimod.BinaryQuadraticModel for the discretised
+    collateral problem.
 
     Parameters
     ----------
@@ -54,7 +106,7 @@ def build_qubo(assets, obligations, num_chunks=10, penalty_weight=1.0):
 
     Returns
     -------
-    Q            : np.ndarray — upper-triangular QUBO matrix
+    bqm          : dimod.BinaryQuadraticModel — the QUBO model
     var_map      : list of (asset_idx, obligation_idx, chunk_idx) per variable
     chunk_sizes  : np.ndarray — market-value per chunk for each asset
     """
@@ -72,14 +124,17 @@ def build_qubo(assets, obligations, num_chunks=10, penalty_weight=1.0):
                     var_map.append((i, j, k))
 
     num_vars = len(var_map)
-    Q = np.zeros((num_vars, num_vars))
+
+    # We build Q as a dict-of-dicts for dimod
+    linear = {}
+    quadratic = {}
 
     def effective_chunk(i):
         return chunk_sizes[i] * (1.0 - assets[i]["haircut"])
 
-    # (1) OBJECTIVE — opportunity cost (diagonal)
+    # (1) OBJECTIVE — opportunity cost (linear/diagonal)
     for v, (i, j, k) in enumerate(var_map):
-        Q[v, v] += assets[i]["opportunity_cost"] * chunk_sizes[i]
+        linear[v] = linear.get(v, 0.0) + assets[i]["opportunity_cost"] * chunk_sizes[i]
 
     # Penalty scaling — must dominate the objective
     max_obj_per_chunk = max(
@@ -95,139 +150,52 @@ def build_qubo(assets, obligations, num_chunks=10, penalty_weight=1.0):
         R_j = ob["required_value"]
         vars_j = [(v, effective_chunk(i2)) for v, (i2, j2, k2) in enumerate(var_map) if j2 == j]
 
-        idxs = np.array([v for v, _ in vars_j])
-        effs = np.array([e for _, e in vars_j])
+        idxs = [v for v, _ in vars_j]
+        effs = [e for _, e in vars_j]
 
         # Diagonal: e_v^2 - 2*R_j*e_v
-        Q[idxs, idxs] += base_penalty * (effs * effs - 2.0 * R_j * effs)
+        for idx, eff in zip(idxs, effs):
+            linear[idx] = linear.get(idx, 0.0) + base_penalty * (eff * eff - 2.0 * R_j * eff)
 
         # Off-diagonal (upper triangle): 2 * e_a * e_b
-        if len(idxs) > 1:
-            outer = base_penalty * 2.0 * np.outer(effs, effs)
-            for a_idx in range(len(idxs)):
-                for b_idx in range(a_idx + 1, len(idxs)):
-                    Q[idxs[a_idx], idxs[b_idx]] += outer[a_idx, b_idx]
+        for a_pos in range(len(idxs)):
+            for b_pos in range(a_pos + 1, len(idxs)):
+                key = (idxs[a_pos], idxs[b_pos])
+                quadratic[key] = quadratic.get(key, 0.0) + base_penalty * 2.0 * effs[a_pos] * effs[b_pos]
 
     # (3) PENALTY — inventory limits
     #     P * (sum_bits - num_chunks)^2
     inv_penalty = base_penalty * 1.0
 
     for i in range(num_assets):
-        vars_i = np.array([v for v, (i2, j2, k2) in enumerate(var_map) if i2 == i])
+        vars_i = [v for v, (i2, j2, k2) in enumerate(var_map) if i2 == i]
         if len(vars_i) == 0:
             continue
         C_i = num_chunks
-        Q[vars_i, vars_i] += inv_penalty * (1.0 - 2.0 * C_i)
-        for a_idx in range(len(vars_i)):
-            for b_idx in range(a_idx + 1, len(vars_i)):
-                Q[vars_i[a_idx], vars_i[b_idx]] += inv_penalty * 2.0
+        for idx in vars_i:
+            linear[idx] = linear.get(idx, 0.0) + inv_penalty * (1.0 - 2.0 * C_i)
+        for a_pos in range(len(vars_i)):
+            for b_pos in range(a_pos + 1, len(vars_i)):
+                key = (vars_i[a_pos], vars_i[b_pos])
+                quadratic[key] = quadratic.get(key, 0.0) + inv_penalty * 2.0
 
-    return Q, var_map, chunk_sizes
+    bqm = dimod.BinaryQuadraticModel(linear, quadratic, 0.0, dimod.BINARY)
 
-
-# ---------------------------------------------------------------------------
-# SIMULATED ANNEALING — VECTORISED
-# ---------------------------------------------------------------------------
-
-def simulated_annealing(Q, num_reads=20, num_sweeps=5000, seed=42):
-    """
-    Solve QUBO via simulated annealing with vectorised delta-energy
-    computation.  Runs multiple SA chains in parallel via batch processing.
-
-    Parameters
-    ----------
-    Q          : np.ndarray — QUBO matrix (upper triangular)
-    num_reads  : int — number of independent SA runs (best returned)
-    num_sweeps : int — number of temperature sweeps per run
-    seed       : int — random seed
-
-    Returns
-    -------
-    best_x     : np.ndarray of {0, 1}
-    best_energy: float
-    """
-    rng = np.random.default_rng(seed)
-    n = Q.shape[0]
-
-    # Precompute full symmetric interaction matrix
-    Q_full = Q + Q.T
-    Q_diag = np.diag(Q).copy()
-
-    # Temperature schedule (geometric)
-    T_start = float(np.abs(Q).max()) * 2.0
-    T_end = T_start * 1e-8
-    temps = T_start * np.power(T_end / T_start, np.arange(num_sweeps) / max(num_sweeps - 1, 1))
-
-    best_x = None
-    best_energy = np.inf
-
-    for _ in range(num_reads):
-        x = rng.integers(0, 2, size=n).astype(np.float64)
-        # Maintain h = Q_full @ x  for O(n) delta energy lookups
-        h = Q_full @ x
-
-        e = float(x @ Q @ x)
-
-        for step in range(num_sweeps):
-            T = temps[step]
-
-            # Shuffle visit order
-            order = rng.permutation(n)
-
-            # Process in mini-batches to amortise Python overhead
-            # Each batch: compute delta energies vectorised, accept/reject
-            batch_size = min(n, 64)
-            for start in range(0, n, batch_size):
-                batch = order[start:start + batch_size]
-                blen = len(batch)
-
-                # Delta energy for flipping each bit in batch
-                s = x[batch]
-                # delta_if_0to1 = Q_diag[i] + h[i] - Q_full[i,i]*x[i]
-                # = Q_diag[i] + (h[i] - Q_full[i,i]*s)
-                delta_raw = Q_diag[batch] + h[batch] - Q_full[batch, batch] * s
-                # If bit is currently 1, flip sign
-                delta = np.where(s == 1, -delta_raw, delta_raw)
-
-                # Metropolis acceptance
-                accept = delta < 0
-                if T > 1e-30:
-                    rand_vals = rng.random(blen)
-                    boltzmann = np.exp(np.clip(-delta / T, -500, 500))
-                    accept = accept | (rand_vals < boltzmann)
-
-                # Apply accepted flips one by one (must be sequential
-                # to keep h consistent, but the accept decision is batched)
-                for k in range(blen):
-                    if accept[k]:
-                        idx = batch[k]
-                        old_val = x[idx]
-                        new_val = 1.0 - old_val
-                        x[idx] = new_val
-                        # Update h incrementally: O(n)
-                        diff = new_val - old_val
-                        h += Q_full[:, idx] * diff
-                        e += delta[k] if old_val == 0 else -delta_raw[k]
-
-        if e < best_energy:
-            best_energy = e
-            best_x = x.copy()
-
-    return best_x.astype(int), best_energy
+    return bqm, var_map, chunk_sizes
 
 
 # ---------------------------------------------------------------------------
 # DECODE SOLUTION
 # ---------------------------------------------------------------------------
 
-def decode_solution(x_binary, var_map, chunk_sizes, assets, obligations):
-    """Convert binary QUBO solution back into an allocation matrix."""
+def decode_solution(sample, var_map, chunk_sizes, assets, obligations):
+    """Convert a D-Wave sample dict back into an allocation matrix."""
     num_assets = len(assets)
     num_obligations = len(obligations)
     allocation = np.zeros((num_assets, num_obligations))
 
     for v, (i, j, k) in enumerate(var_map):
-        if x_binary[v] == 1:
+        if sample[v] == 1:
             allocation[i, j] += chunk_sizes[i]
 
     total_cost = sum(
@@ -250,21 +218,83 @@ def decode_solution(x_binary, var_map, chunk_sizes, assets, obligations):
 # ---------------------------------------------------------------------------
 
 def solve_qubo(assets=None, obligations=None, num_chunks=10,
-               penalty_weight=1.0, num_reads=20, num_sweeps=5000, seed=42):
+               penalty_weight=1.0, num_reads=20, num_sweeps=5000, seed=42,
+               beta_range=None, beta_schedule_type="geometric",
+               backend="neal", annealing_time=None, chain_strength=None,
+               time_limit=None):
     """
-    Solve collateral optimisation via QUBO + simulated annealing.
+    Solve collateral optimisation via QUBO using a D-Wave Ocean SDK sampler.
 
-    Returns dict with keys: allocation, total_cost, success, assets,
-    obligations, qubo_energy, num_vars, constraint_violations
+    Parameters
+    ----------
+    assets       : list of asset dicts (default: problem_data.ASSETS)
+    obligations  : list of obligation dicts (default: problem_data.OBLIGATIONS)
+    num_chunks   : int — binary bits per (asset, obligation) pair
+    penalty_weight : float — multiplier for constraint-violation penalties
+    num_reads    : int — number of independent SA/QPU runs (best returned)
+    num_sweeps   : int — number of sweeps per SA run (neal only)
+    seed         : int — random seed for reproducibility (neal only)
+    beta_range   : tuple(float, float) or None — (beta_min, beta_max) inverse
+                   temperature range. None lets Neal auto-calculate. (neal only)
+    beta_schedule_type : str — "geometric" or "linear" temperature schedule
+                   (neal only)
+    backend      : str — sampler backend:
+                   "neal"   — local simulated annealing (default, no cloud)
+                   "qpu"    — D-Wave Advantage quantum annealer (Leap cloud)
+                   "hybrid" — D-Wave hybrid classical-quantum solver (Leap cloud)
+    annealing_time : int or None — QPU annealing time in microseconds (qpu only,
+                   default 20us, max 2000us). Longer times can improve quality.
+    chain_strength : float or None — coupling strength for embedding chains
+                   (qpu only). None lets EmbeddingComposite auto-calculate.
+    time_limit   : int or None — time limit in seconds (hybrid only, minimum 3).
+
+    Returns
+    -------
+    dict with keys: allocation, total_cost, success, assets, obligations,
+                    qubo_energy, num_vars, constraint_violations, sampleset,
+                    backend
     """
     if assets is None:
         assets = ASSETS
     if obligations is None:
         obligations = OBLIGATIONS
 
-    Q, var_map, chunk_sizes = build_qubo(assets, obligations, num_chunks, penalty_weight)
-    x_binary, qubo_energy = simulated_annealing(Q, num_reads, num_sweeps, seed)
-    sol = decode_solution(x_binary, var_map, chunk_sizes, assets, obligations)
+    bqm, var_map, chunk_sizes = build_qubo(assets, obligations, num_chunks, penalty_weight)
+
+    sampler = _make_sampler(backend)
+
+    # Build sampler-specific parameters
+    if backend == "neal":
+        sample_params = {
+            "num_reads": num_reads,
+            "num_sweeps": num_sweeps,
+            "seed": seed,
+            "beta_schedule_type": beta_schedule_type,
+        }
+        if beta_range is not None:
+            sample_params["beta_range"] = beta_range
+
+    elif backend == "qpu":
+        sample_params = {
+            "num_reads": num_reads,
+        }
+        if annealing_time is not None:
+            sample_params["annealing_time"] = annealing_time
+        if chain_strength is not None:
+            sample_params["chain_strength"] = chain_strength
+
+    elif backend == "hybrid":
+        sample_params = {}
+        if time_limit is not None:
+            sample_params["time_limit"] = time_limit
+
+    sampleset = sampler.sample(bqm, **sample_params)
+
+    # Extract best sample
+    best_sample = sampleset.first.sample
+    qubo_energy = sampleset.first.energy
+
+    sol = decode_solution(best_sample, var_map, chunk_sizes, assets, obligations)
 
     # Check constraint satisfaction
     violations = []
@@ -285,6 +315,8 @@ def solve_qubo(assets=None, obligations=None, num_chunks=10,
     sol["qubo_energy"] = qubo_energy
     sol["num_vars"] = len(var_map)
     sol["constraint_violations"] = violations
+    sol["sampleset"] = sampleset
+    sol["backend"] = backend
     return sol
 
 
@@ -294,8 +326,12 @@ def print_results(sol):
     obligations = sol["obligations"]
     x = sol["allocation"]
 
+    backend = sol.get("backend", "neal")
+    backend_labels = {"neal": "D-Wave Neal SA", "qpu": "D-Wave QPU", "hybrid": "D-Wave Hybrid"}
+    label = backend_labels.get(backend, backend)
+
     print("=" * 80)
-    print("QUBO (Simulated Annealing) -- COLLATERAL OPTIMISATION RESULTS")
+    print(f"QUBO ({label}) -- COLLATERAL OPTIMISATION RESULTS")
     print("=" * 80)
     print(f"\nTotal opportunity cost: ${sol['total_cost']:,.0f}")
     print(f"QUBO energy: {sol['qubo_energy']:,.2f}")
@@ -331,5 +367,35 @@ def print_results(sol):
 
 
 if __name__ == "__main__":
-    sol = solve_qubo(num_chunks=10, num_reads=20, num_sweeps=5000)
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Collateral Optimisation via QUBO")
+    parser.add_argument("--backend", choices=["neal", "qpu", "hybrid"], default="neal",
+                        help="Sampler backend (default: neal)")
+    parser.add_argument("--num-chunks", type=int, default=10,
+                        help="Binary bits per (asset, obligation) pair (default: 10)")
+    parser.add_argument("--num-reads", type=int, default=20,
+                        help="Number of SA/QPU reads (default: 20)")
+    parser.add_argument("--num-sweeps", type=int, default=5000,
+                        help="Sweeps per SA run, neal only (default: 5000)")
+    parser.add_argument("--penalty-weight", type=float, default=1.0,
+                        help="Constraint penalty multiplier (default: 1.0)")
+    parser.add_argument("--annealing-time", type=int, default=None,
+                        help="QPU annealing time in microseconds, qpu only (default: 20)")
+    parser.add_argument("--chain-strength", type=float, default=None,
+                        help="Embedding chain strength, qpu only (default: auto)")
+    parser.add_argument("--time-limit", type=int, default=None,
+                        help="Time limit in seconds, hybrid only (default: auto)")
+    args = parser.parse_args()
+
+    sol = solve_qubo(
+        num_chunks=args.num_chunks,
+        num_reads=args.num_reads,
+        num_sweeps=args.num_sweeps,
+        penalty_weight=args.penalty_weight,
+        backend=args.backend,
+        annealing_time=args.annealing_time,
+        chain_strength=args.chain_strength,
+        time_limit=args.time_limit,
+    )
     print_results(sol)
