@@ -137,6 +137,7 @@ def main():
         )
         mip_ms = (time.perf_counter() - t0) * 1000
         mip_ok = mip_sol["success"] and mip_sol["allocation"] is not None
+        mip_optimal = mip_sol.get("optimal", mip_sol["success"])
         mip_cost = mip_sol["total_cost"] if mip_ok else float("inf")
 
         # --- QUBO ---
@@ -173,7 +174,12 @@ def main():
         gap_val = ((qubo_cost - mip_cost) / mip_cost * 100) if mip_ok else float("nan")
         gap_str = f"{gap_val:+.1f}%" if not np.isnan(gap_val) else "N/A"
 
-        mip_c = f"${mip_cost:,.0f}" if mip_ok else "TIMEOUT"
+        if mip_ok and mip_optimal:
+            mip_c = f"${mip_cost:,.0f}"
+        elif mip_ok and not mip_optimal:
+            mip_c = f"${mip_cost:,.0f}*"
+        else:
+            mip_c = "TIMEOUT"
 
         print(f"  {label:<22s} {mip_c:>12s} {mip_ms:>10.0f} "
               f"{'Y' if mip_ok else 'N':>4s} "
@@ -185,6 +191,7 @@ def main():
         results.append({
             "label": label, "na": na, "no": no, "mta": mta, "conc": conc,
             "mip_cost": mip_cost, "mip_ms": mip_ms, "mip_ok": mip_ok,
+            "mip_optimal": mip_optimal,
             "qubo_cost": qubo_cost, "qubo_ms": qubo_ms, "qubo_ok": qubo_ok,
             "qubo_vars": qubo_vars, "winner": winner, "gap": gap_val,
         })
@@ -200,11 +207,13 @@ def main():
     qubo_wins = [r for r in results if "QUBO" in r["winner"]]
     neither = [r for r in results if r["winner"] == "Neither"]
     mip_timeouts = [r for r in results if not r["mip_ok"]]
+    mip_suboptimal = [r for r in results if r["mip_ok"] and not r["mip_optimal"]]
 
-    print(f"\n  MIP wins:     {len(mip_wins)}")
-    print(f"  QUBO wins:    {len(qubo_wins)}")
-    print(f"  Neither:      {len(neither)}")
-    print(f"  MIP timeouts: {len(mip_timeouts)}")
+    print(f"\n  MIP wins:      {len(mip_wins)}")
+    print(f"  QUBO wins:     {len(qubo_wins)}")
+    print(f"  Neither:       {len(neither)}")
+    print(f"  MIP timeouts:  {len(mip_timeouts)}  (no feasible solution found)")
+    print(f"  MIP suboptimal:{len(mip_suboptimal)}  (feasible but not proven optimal, marked with *)")
 
     if mip_timeouts:
         first_to = mip_timeouts[0]

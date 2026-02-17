@@ -170,7 +170,7 @@ def solve_mip(assets=None, obligations=None, lot_size=1_000_000,
     result = milp(c, integrality=integrality, bounds=bounds,
                   constraints=constraints, options=options)
 
-    if not result.success:
+    if not result.success and result.x is None:
         return {
             "allocation": None, "total_cost": None, "success": False,
             "assets": assets, "obligations": obligations,
@@ -187,8 +187,10 @@ def solve_mip(assets=None, obligations=None, lot_size=1_000_000,
         "allocation": allocation,
         "total_cost": result.fun,
         "success": True,
+        "optimal": result.success,
         "assets": assets,
         "obligations": obligations,
+        "message": result.message,
     }
 
 
