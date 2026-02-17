@@ -3,7 +3,11 @@
     "allow": [
       "Bash(python:*)",
       "Bash(pip install:*)",
-      "Bash(del \"c:\\\\Users\\\\Aleksandar\\\\Desktop\\\\CollateralOptimisation\\\\verify_mip.py\")"
+      "Bash(del \"c:\\\\Users\\\\Aleksandar\\\\Desktop\\\\CollateralOptimisation\\\\verify_mip.py\")",
+      "WebFetch(domain:docs.ocean.dwavesys.com)",
+      "WebFetch(domain:docs.dwavequantum.com)",
+      "WebFetch(domain:support.dwavesys.com)",
+      "WebFetch(domain:github.com)"
     ]
   }
 }

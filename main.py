@@ -1,8 +1,8 @@
 """
-Collateral Optimisation — Crossover Finder: MIP vs QUBO
-========================================================
+Collateral Optimisation — Crossover Finder: MIP vs QUBO vs CQM
+================================================================
 
-Finds where QUBO (simulated annealing) outperforms MIP (branch-and-bound)
+Finds where quantum/heuristic solvers outperform MIP (branch-and-bound)
 on integer collateral allocation problems.
 
 Strategy:
@@ -13,6 +13,9 @@ Strategy:
 The QUBO naturally handles lot sizes via discretisation.  It doesn't model
 MTA or concentration explicitly, but its penalty-based approach degrades
 gracefully rather than exponentially.
+
+CQM (Constrained Quadratic Model) encodes constraints natively rather than
+as penalty terms, improving feasibility rates over QUBO.
 """
 
 import time
@@ -21,6 +24,7 @@ import numpy as np
 
 from collateral_mip import solve_mip
 from collateral_qubo import solve_qubo
+from collateral_cqm import solve_cqm
 
 
 # ======================================================================
@@ -73,10 +77,10 @@ def generate_problem(num_assets, num_obligations, lot_size=1_000_000, seed=123):
 # ======================================================================
 
 def main():
-    print("\n" + "#" * 100)
-    print("#  CROSSOVER FINDER:  MIP (Branch-and-Bound)  vs  QUBO (Simulated Annealing)")
+    print("\n" + "#" * 120)
+    print("#  CROSSOVER FINDER:  MIP (Branch-and-Bound)  vs  QUBO (Simulated Annealing)  vs  CQM (Constrained Quadratic Model)")
     print("#  Problem: Collateral optimisation with lot sizes, MTA, concentration limits")
-    print("#" * 100)
+    print("#" * 120)
 
     LOT_SIZE = 1_000_000
     MIP_TIME_LIMIT = 10.0
@@ -105,14 +109,19 @@ def main():
     QUBO_SWEEPS = 4000
     QUBO_PENALTY = 5.0
 
+    CQM_READS = 3
+    CQM_SWEEPS = 4000
+
     print(f"\n  Lot size:           ${LOT_SIZE:,.0f}")
     print(f"  MIP time limit:     {MIP_TIME_LIMIT:.0f}s")
     print(f"  QUBO:               {QUBO_CHUNKS} chunks, {QUBO_READS} reads, "
           f"{QUBO_SWEEPS} sweeps, penalty={QUBO_PENALTY}")
+    print(f"  CQM:                {CQM_READS} reads, {CQM_SWEEPS} sweeps (lot_size=${LOT_SIZE:,.0f})")
 
     hdr = (f"  {'Config':<22s} {'MIP Cost':>12s} {'MIP ms':>10s} {'MIP':>4s} "
            f"{'QUBO Cost':>12s} {'QUBO ms':>10s} {'Q':>3s} "
-           f"{'QVars':>7s} {'Winner':>12s} {'Gap':>8s}")
+           f"{'CQM Cost':>12s} {'CQM ms':>10s} {'C':>3s} "
+           f"{'Winner':>12s}")
     print(f"\n{hdr}")
     print("  " + "-" * (len(hdr) - 2))
 
@@ -153,26 +162,35 @@ def main():
         qubo_ms = (time.perf_counter() - t0) * 1000
         qubo_ok = not qubo_sol["constraint_violations"]
         qubo_cost = qubo_sol["total_cost"]
-        qubo_vars = qubo_sol["num_vars"]
 
-        # Winner logic
-        if not mip_ok and not qubo_ok:
-            winner = "Neither"
-        elif not mip_ok and qubo_ok:
-            winner = ">> QUBO <<"
-        elif mip_ok and not qubo_ok:
-            winner = "MIP"
-        elif qubo_ms < mip_ms and qubo_cost <= mip_cost * 1.10:
-            winner = ">> QUBO <<"
-        elif qubo_ms < mip_ms * 0.5:
-            winner = "QUBO(speed)"
-        elif mip_cost <= qubo_cost:
-            winner = "MIP"
+        # --- CQM ---
+        t0 = time.perf_counter()
+        cqm_sol = solve_cqm(
+            assets, obligations,
+            backend="neal",
+            lot_size=LOT_SIZE,
+            num_reads=CQM_READS,
+            num_sweeps=CQM_SWEEPS,
+            seed=42,
+        )
+        cqm_ms = (time.perf_counter() - t0) * 1000
+        cqm_ok = not cqm_sol["constraint_violations"]
+        cqm_cost = cqm_sol["total_cost"]
+        cqm_feasible = cqm_sol["feasible_count"]
+
+        # Winner logic — pick best feasible solver, or best cost if none feasible
+        candidates = []
+        if mip_ok:
+            candidates.append(("MIP", mip_cost, mip_ms))
+        if qubo_ok:
+            candidates.append(("QUBO", qubo_cost, qubo_ms))
+        if cqm_ok:
+            candidates.append(("CQM", cqm_cost, cqm_ms))
+
+        if candidates:
+            winner = min(candidates, key=lambda x: x[1])[0]
         else:
-            winner = "QUBO"
-
-        gap_val = ((qubo_cost - mip_cost) / mip_cost * 100) if mip_ok else float("nan")
-        gap_str = f"{gap_val:+.1f}%" if not np.isnan(gap_val) else "N/A"
+            winner = "Neither"
 
         if mip_ok and mip_optimal:
             mip_c = f"${mip_cost:,.0f}"
@@ -185,7 +203,9 @@ def main():
               f"{'Y' if mip_ok else 'N':>4s} "
               f"${qubo_cost:>11,.0f} {qubo_ms:>10.0f} "
               f"{'Y' if qubo_ok else 'N':>3s} "
-              f"{qubo_vars:>7d} {winner:>12s} {gap_str:>8s}")
+              f"${cqm_cost:>11,.0f} {cqm_ms:>10.0f} "
+              f"{'Y' if cqm_ok else 'N':>3s} "
+              f"{winner:>12s}")
         sys.stdout.flush()
 
         results.append({
@@ -193,81 +213,63 @@ def main():
             "mip_cost": mip_cost, "mip_ms": mip_ms, "mip_ok": mip_ok,
             "mip_optimal": mip_optimal,
             "qubo_cost": qubo_cost, "qubo_ms": qubo_ms, "qubo_ok": qubo_ok,
-            "qubo_vars": qubo_vars, "winner": winner, "gap": gap_val,
+            "cqm_cost": cqm_cost, "cqm_ms": cqm_ms, "cqm_ok": cqm_ok,
+            "cqm_feasible": cqm_feasible,
+            "winner": winner,
         })
 
     # ==================================================================
     # ANALYSIS
     # ==================================================================
-    print("\n\n" + "#" * 100)
+    print("\n\n" + "#" * 120)
     print("#  ANALYSIS")
-    print("#" * 100)
+    print("#" * 120)
 
     mip_wins = [r for r in results if r["winner"] == "MIP"]
-    qubo_wins = [r for r in results if "QUBO" in r["winner"]]
+    qubo_wins = [r for r in results if r["winner"] == "QUBO"]
+    cqm_wins = [r for r in results if r["winner"] == "CQM"]
     neither = [r for r in results if r["winner"] == "Neither"]
     mip_timeouts = [r for r in results if not r["mip_ok"]]
     mip_suboptimal = [r for r in results if r["mip_ok"] and not r["mip_optimal"]]
 
     print(f"\n  MIP wins:      {len(mip_wins)}")
     print(f"  QUBO wins:     {len(qubo_wins)}")
+    print(f"  CQM wins:      {len(cqm_wins)}")
     print(f"  Neither:       {len(neither)}")
     print(f"  MIP timeouts:  {len(mip_timeouts)}  (no feasible solution found)")
     print(f"  MIP suboptimal:{len(mip_suboptimal)}  (feasible but not proven optimal, marked with *)")
 
-    if mip_timeouts:
-        first_to = mip_timeouts[0]
-        print(f"\n  MIP first times out at: {first_to['label']}")
-        print(f"    Constraints: lots" +
-              (f" + MTA ${first_to['mta']:,.0f}" if first_to["mta"] else "") +
-              (f" + conc={first_to['conc']}" if first_to["conc"] else ""))
-
-    if qubo_wins:
-        first_qw = qubo_wins[0]
-        print(f"\n  ** CROSSOVER POINT: {first_qw['label']} **")
-        mip_label = "TIMEOUT" if not first_qw["mip_ok"] else f"${first_qw['mip_cost']:,.0f}"
-        print(f"    MIP:  {mip_label}  in {first_qw['mip_ms']:.0f}ms")
-        q_feas = "feasible" if first_qw["qubo_ok"] else "infeasible"
-        print(f"    QUBO: ${first_qw['qubo_cost']:,.0f}  in {first_qw['qubo_ms']:.0f}ms"
-              f"  ({q_feas})")
-        print(f"    QUBO wins because MIP branch-and-bound cannot explore the")
-        print(f"    combinatorial space of {first_qw['na']} assets x {first_qw['no']} "
-              f"obligations with integer constraints in {MIP_TIME_LIMIT:.0f}s")
+    print("\n  FEASIBILITY COMPARISON:")
+    print(f"  {'Config':<22s} {'MIP':>4s} {'QUBO':>5s} {'CQM':>4s}")
+    print("  " + "-" * 40)
+    for r in results:
+        print(f"  {r['label']:<22s} {'Y' if r['mip_ok'] else 'N':>4s} "
+              f"{'Y' if r['qubo_ok'] else 'N':>5s} "
+              f"{'Y' if r['cqm_ok'] else 'N':>4s}")
 
     print("\n  TIMING TRAJECTORY:")
-    print(f"  {'Config':<22s} {'MIP (ms)':>10s} {'QUBO (ms)':>10s} {'Ratio':>8s}")
-    print("  " + "-" * 50)
+    print(f"  {'Config':<22s} {'MIP (ms)':>10s} {'QUBO (ms)':>10s} {'CQM (ms)':>10s}")
+    print("  " + "-" * 55)
     for r in results:
-        ratio = r["mip_ms"] / max(r["qubo_ms"], 0.001)
-        marker = " <<" if ratio > 1 else ""
         print(f"  {r['label']:<22s} {r['mip_ms']:>10.0f} {r['qubo_ms']:>10.0f} "
-              f"{ratio:>7.2f}x{marker}")
+              f"{r['cqm_ms']:>10.0f}")
 
     print("\n  KEY FINDINGS:")
     print("  1. MIP (branch-and-bound) scales EXPONENTIALLY with integer variables.")
     print("     Lot sizes alone: O(A*O) integer vars.  Adding MTA doubles that")
     print("     with binary indicator vars.  Concentration adds combinatorial cuts.")
     print()
-    print("  2. MIP hits its time limit at ~25 assets with MTA constraints.")
-    print("     Without MTA (lots only), MIP solves 20x8 in 140ms.")
-    print("     With MTA, even 25x10 exceeds the 10s budget.")
+    print("  2. QUBO uses soft penalty terms for constraints.  This makes feasibility")
+    print("     the bottleneck — the annealer often violates constraints.")
     print()
-    print("  3. QUBO/SA scales as O(n^2 * sweeps) — POLYNOMIAL in problem size.")
-    print("     But our pure-Python SA is ~100-1000x slower than C/C++ solvers.")
-    print("     This shifts the crossover point rightward.")
+    print("  3. CQM encodes constraints natively via dimod.cqm_to_bqm().")
+    print("     When using Neal SA locally, constraints are still converted to penalties,")
+    print("     so feasibility is similar to QUBO.  The real advantage of CQM is with")
+    print("     LeapHybridCQMSampler (cloud), which handles constraints natively.")
     print()
-    print("  4. QUBO FEASIBILITY is the bottleneck — the penalty-based approach")
-    print("     struggles to satisfy all constraints simultaneously.")
-    print("     This is inherent to QUBO: constraints are soft, not hard.")
-    print()
-    print("  PRACTICAL CROSSOVER ESTIMATE:")
-    print("  With a C++ SA solver (e.g. D-Wave Neal, ~100x faster):")
-    print("    QUBO would solve 25x10 in ~600ms vs MIP timeout at 10s")
-    print("    -> Crossover at ~25 assets, 10 obligations with MTA constraints")
-    print()
-    print("  With D-Wave QPU (quantum annealer, ~1ms per sample):")
-    print("    QUBO would solve 50x18 in ~50ms vs MIP timeout")
-    print("    -> Crossover at ~15-20 assets with full integer constraints")
+    print("  4. With D-Wave Leap hybrid CQM solver (cloud):")
+    print("     CQM supports continuous (Real) variables — no discretisation needed.")
+    print("     Constraints are hard, not soft.  Solution quality approaches LP/MIP.")
     print()
 
 

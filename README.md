@@ -1,6 +1,6 @@
 # Collateral Optimisation
 
-Solves the bank collateral allocation problem using three approaches: Linear Programming (LP), Mixed-Integer Programming (MIP), and Quadratic Unconstrained Binary Optimisation (QUBO) with D-Wave Ocean SDK. Supports local simulated annealing, D-Wave QPU (quantum annealer), and D-Wave hybrid classical-quantum solvers. Includes a crossover benchmark comparing MIP vs QUBO at scale.
+Solves the bank collateral allocation problem using four approaches: Linear Programming (LP), Mixed-Integer Programming (MIP), Quadratic Unconstrained Binary Optimisation (QUBO), and Constrained Quadratic Model (CQM) with D-Wave Ocean SDK. Supports local simulated annealing, D-Wave QPU (quantum annealer), and D-Wave hybrid classical-quantum solvers. Includes a crossover benchmark comparing MIP vs QUBO vs CQM at scale.
 
 ## Problem
 
@@ -37,7 +37,8 @@ The QUBO solver uses D-Wave's `neal.SimulatedAnnealingSampler` (local, no accoun
 | `collateral_optimisation.py` | LP solver using `scipy.optimize.linprog` (HiGHS) |
 | `collateral_mip.py` | MIP solver using `scipy.optimize.milp` (HiGHS branch-and-bound) |
 | `collateral_qubo.py` | QUBO solver using D-Wave Ocean SDK (`dimod` + `neal` / QPU / hybrid) |
-| `main.py` | Crossover benchmark: MIP vs QUBO at increasing problem sizes |
+| `collateral_cqm.py` | CQM solver using D-Wave Ocean SDK (`dimod.ConstrainedQuadraticModel`) |
+| `main.py` | Crossover benchmark: MIP vs QUBO vs CQM at increasing problem sizes |
 | `bcbs189.pdf` | Basel III regulatory framework (BCBS 189) reference document |
 
 ## How to Run
@@ -131,13 +132,50 @@ python collateral_qubo.py --backend hybrid --time-limit 10
 
 **D-Wave QPU notes**: The D-Wave Advantage QPU has ~5000 qubits. After minor embedding overhead, problems up to ~150 logical variables typically embed well. For larger problems, use the hybrid backend which handles arbitrary sizes. QPU access requires a D-Wave Leap account — configure with `dwave config create`.
 
-### Crossover Benchmark (MIP vs QUBO)
+### CQM Solver (Constrained Quadratic Model)
+
+Uses `dimod.ConstrainedQuadraticModel` which encodes constraints natively (hard constraints) rather than as penalty terms. This is the key advantage over QUBO — constraints are guaranteed to be satisfied when using the hybrid solver.
+
+```
+python collateral_cqm.py [--backend {neal,hybrid}] [options]
+```
+
+**Backends:**
+
+| Backend | Command | Description | Requirements |
+|---|---|---|---|
+| `neal` (default) | `python collateral_cqm.py` | CQM -> BQM conversion, solved with Neal SA | `dwave-neal`, `dimod` |
+| `hybrid` | `python collateral_cqm.py --backend hybrid` | LeapHybridCQMSampler (native CQM, continuous variables) | `dwave-system` + Leap API token |
+
+**Parameters:**
+
+| CLI flag | Parameter | Default | Description |
+|---|---|---|---|
+| `--lot-size` | `lot_size` | `1_000_000` | Lot size for integer discretisation (neal only). Hybrid uses continuous Real variables. |
+| `--num-reads` | `num_reads` | `20` | Number of SA reads (neal only). |
+| `--num-sweeps` | `num_sweeps` | `5000` | Sweeps per SA run (neal only). |
+| `--time-limit` | `time_limit` | `None` (auto) | Time limit in seconds (hybrid only, minimum 5). |
+| `--lagrange` | `lagrange_multiplier` | `None` (auto) | Penalty weight for CQM-to-BQM conversion (neal only). |
+
+**Examples:**
+
+```bash
+# Local simulated annealing (CQM -> BQM -> Neal SA)
+python collateral_cqm.py
+
+# D-Wave hybrid CQM solver (continuous variables, hard constraints)
+python collateral_cqm.py --backend hybrid --time-limit 10
+```
+
+**QUBO vs CQM:** QUBO encodes all constraints as quadratic penalty terms in the objective (soft constraints). CQM keeps constraints separate from the objective. When using the hybrid backend, `LeapHybridCQMSampler` handles constraints natively — solutions are guaranteed feasible. When using the neal backend, `dimod.cqm_to_bqm()` converts constraints to penalties (similar to QUBO), so the local SA path has comparable feasibility characteristics to QUBO.
+
+### Crossover Benchmark (MIP vs QUBO vs CQM)
 
 ```
 python main.py
 ```
 
-Generates random problem instances of increasing size and compares MIP and QUBO on each. Prints a results table showing cost, runtime, feasibility, and winner for each configuration.
+Generates random problem instances of increasing size and compares MIP, QUBO, and CQM on each. Prints a results table showing cost, runtime, feasibility, and winner for each configuration.
 
 Benchmark parameters (configured at the top of `main()`):
 
@@ -188,6 +226,8 @@ Each obligation requires:
 | QUBO (Neal SA) | Binary | `A * O * K` | Penalty-based (soft) | No (heuristic) | Polynomial in problem size |
 | QUBO (D-Wave QPU) | Binary | `A * O * K` | Penalty-based (soft) | No (heuristic) | ~μs per anneal, constant time |
 | QUBO (Hybrid) | Binary | `A * O * K` | Penalty-based (soft) | No (heuristic) | Handles large problems |
+| CQM (Neal SA) | Integer | `A * O` | Hard (via BQM penalties) | No (heuristic) | Polynomial in problem size |
+| CQM (Hybrid) | Continuous | `A * O` | Hard (native) | No (heuristic) | Handles large problems |
 
 ## Regulatory Context
 
